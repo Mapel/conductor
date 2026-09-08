@@ -2440,12 +2440,13 @@ async def run_workflow_async(
     redaction_token: Token[RunRedactor | None] | None = None
 
     if web:
+        from conductor.web.bind import resolve_dashboard_host
         from conductor.web.server import WebDashboard
 
         bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
         dashboard = WebDashboard(
             emitter,
-            host="127.0.0.1",
+            host=resolve_dashboard_host(),
             port=web_port,
             bg=bg_mode,
             workflow_root=Path(workflow_path).resolve().parent,
@@ -3426,12 +3427,13 @@ async def resume_workflow_async(
         # client both see a fully populated, topology-correct history —
         # no race window where a client connects mid-replay.
         if web:
+            from conductor.web.bind import resolve_dashboard_host
             from conductor.web.server import WebDashboard
 
             bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
             dashboard = WebDashboard(
                 emitter,
-                host="127.0.0.1",
+                host=resolve_dashboard_host(),
                 port=web_port,
                 bg=bg_mode,
                 workflow_root=resolved_workflow_path.resolve().parent,

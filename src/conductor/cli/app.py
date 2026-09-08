@@ -1541,12 +1541,13 @@ def replay(
     import asyncio
 
     async def _run_replay() -> None:
+        from conductor.web.bind import resolve_dashboard_host
         from conductor.web.replay import ReplayDashboard
 
         try:
             dashboard = ReplayDashboard(
                 log_file.resolve(),
-                host="127.0.0.1",
+                host=resolve_dashboard_host(),
                 port=web_port,
             )
         except ValueError as exc:
