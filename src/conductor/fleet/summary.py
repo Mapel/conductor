@@ -104,15 +104,44 @@ def _count_billing(
     data: dict[str, Any],
     tokens: float | None,
     cost: float | None,
+    *,
+    event_type: str,
 ) -> None:
-    """Count one completion event's provenance if, and only if, it contributes usage.
+    """Count one completion's provenance if, and only if, it contributes usage.
 
     The only function any Fleet scanner calls to count billing, so the predicate cannot
     drift between them. ``tokens`` and ``cost`` are the values the scanner already computed
     with :func:`_finite_float`, so the predicate sees exactly what the cost accumulator saw.
+    A subworkflow completion carries the child's aggregate, not one billing mode.
     """
-    if _contributes_usage(tokens, cost):
-        count_mode(counts, coerce_billing_mode(data.get("billing_mode")))
+    if not _contributes_usage(tokens, cost):
+        return
+    if event_type == "subworkflow_completed":
+        try:
+            aggregate = AggregateBilling.from_wire(data.get("billing"), strict=True)
+        except ValueError:
+            aggregate = None
+        if aggregate is not None:
+            for klass, count in aggregate.breakdown.items():
+                counts[klass] = counts.get(klass, 0) + count
+            return
+        # Legacy/malformed child payloads have no trustworthy per-execution
+        # provenance. A billing_mode on the envelope is not the child's
+        # aggregate; do not label all its spend with that one mode.
+        count_mode(counts, None)
+        return
+    count_mode(counts, coerce_billing_mode(data.get("billing_mode")))
+
+
+def _unpriced_count(
+    event_type: str, data: dict[str, Any], tokens: float | None, cost: float | None
+) -> int:
+    """Count missing prices in a completion, including partial child subtotals."""
+    if event_type == "subworkflow_completed":
+        count = data.get("unpriced_agent_count")
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            return count
+    return int(cost is None and tokens is not None and tokens > 0)
 
 
 @dataclass(frozen=True)
@@ -486,6 +515,12 @@ _AGENT_CLOSE_EVENT_TYPES = frozenset(
     }
 )
 
+# Only these closing events report usage. The subworkflow subtotal is in
+# its parent's context; child agent events carry a nonempty subworkflow_path.
+_USAGE_COMPLETION_EVENT_TYPES = frozenset(
+    {"agent_completed", "parallel_agent_completed", "subworkflow_completed"}
+)
+
 # Closing events that mark a step "failed" rather than "completed". Every
 # non-LLM step type emits its own `*_failed` on an unhandled exception
 # (`script_failed`/`wait_failed`/`set_failed`/`subworkflow_failed`), and a
@@ -694,16 +729,15 @@ def _scan_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
                 result.gate = None
                 if result.status == "at-gate":
                     result.status = "running"
-            elif etype in ("agent_completed", "parallel_agent_completed"):
+            elif etype in _USAGE_COMPLETION_EVENT_TYPES:
                 tokens = _finite_float(data.get("tokens"))
                 if tokens is not None:
                     result.total_tokens += int(tokens)
                 cost = _finite_float(data.get("cost_usd"))
                 if cost is not None:
                     result.total_cost_usd = (result.total_cost_usd or 0.0) + cost
-                elif tokens is not None and tokens > 0:
-                    result.unpriced_agent_count += 1
-                _count_billing(result.billing_counts, data, tokens, cost)
+                result.unpriced_agent_count += _unpriced_count(etype, data, tokens, cost)
+                _count_billing(result.billing_counts, data, tokens, cost, event_type=etype)
 
         elif etype in _AGENT_FAILED_EVENT_TYPES:
             # A failed step also closes its open "agent" entry -- otherwise
@@ -889,14 +923,20 @@ def _scan_agent_details(
                 _close_step(open_steps, "agent", name)
                 gated.discard(name)
                 elapsed = data.get("elapsed")
-                if etype in ("agent_completed", "parallel_agent_completed"):
+                if etype in _USAGE_COMPLETION_EVENT_TYPES:
                     tokens = _finite_float(data.get("tokens"))
                     cost = _finite_float(data.get("cost_usd"))
                     if tokens is not None:
                         cumulative_tokens[name] = cumulative_tokens.get(name, 0) + int(tokens)
                     if cost is not None:
                         cumulative_cost[name] = (cumulative_cost.get(name) or 0.0) + cost
-                    _count_billing(cumulative_billing.setdefault(name, {}), data, tokens, cost)
+                    _count_billing(
+                        cumulative_billing.setdefault(name, {}),
+                        data,
+                        tokens,
+                        cost,
+                        event_type=etype,
+                    )
                     closed[name] = (
                         "completed",
                         started_at_by_name.get(name),
@@ -904,10 +944,8 @@ def _scan_agent_details(
                     )
                 else:
                     # script_completed / wait_completed / set_completed /
-                    # gate_resolved / subworkflow_completed: these non-LLM
-                    # step types have no tokens/cost (only a plain agent's
-                    # own agent_completed/parallel_agent_completed carries
-                    # usage data), but the step did complete -- record that
+                    # gate_resolved: these non-LLM step types have no
+                    # usage payload, but the step did complete -- record that
                     # so the row doesn't appear stuck "pending" forever
                     # once its own closing event fires (mirrors
                     # _scan_events's current-step closing behavior for the

@@ -1127,9 +1127,10 @@ def _completion(
     mode: object = "subscription",
     tokens: object = 100,
     cost: object = 0.01,
+    **extra: object,
 ) -> str:
     """A completion event; a ``mode`` of ``...`` omits ``billing_mode`` (a legacy log)."""
-    data: dict[str, Any] = {"agent_name": name, "elapsed": 1.0}
+    data: dict[str, Any] = {"agent_name": name, "elapsed": 1.0, **extra}
     if tokens is not ...:
         data["tokens"] = tokens
     if cost is not ...:
@@ -1148,6 +1149,290 @@ def _entry_for(root: Path, lines: list[str], *, run_id: str = "deadbeef") -> His
 
 def _counts(entry: HistoryEntry) -> dict[str, int]:
     return dict(entry.billing.breakdown) if entry.billing is not None else {}
+
+
+def _child_completion(
+    name: str = "child",
+    *,
+    tokens: object = 100,
+    cost: object = 0.02,
+    unpriced: object = 0,
+    billing: object = ...,
+    **extra: object,
+) -> str:
+    data: dict[str, Any] = {
+        "agent_name": name,
+        "parent_path": [],
+        "slot_key": name,
+        "tokens": tokens,
+        "cost_usd": cost,
+        "unpriced_agent_count": unpriced,
+        **extra,
+    }
+    if billing is not ...:
+        data["billing"] = billing
+    return _event("subworkflow_completed", data)
+
+
+class TestSubworkflowUsageInHistory:
+    def test_malformed_aggregate_ignores_envelope_billing_mode(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _child_completion(
+                    tokens=10,
+                    cost=0.01,
+                    billing={"breakdown": {"subscription": True}},
+                    billing_mode="subscription",
+                )
+            ],
+        )
+        assert _counts(entry) == {"unstated": 1}
+
+    def test_public_reader_accepts_legacy_child_completion_without_usage(
+        self, temp_root: Path
+    ) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _event("workflow_started", {"name": "parent"}, ts=1.0),
+                _event("subworkflow_completed", {"agent_name": "child"}, ts=2.0),
+                _event("workflow_completed", {}, ts=3.0),
+            ],
+        )
+        assert entry.outcome == "completed"
+        assert entry.total_tokens == 0
+        assert entry.total_cost_usd is None
+        assert entry.unpriced_agent_count == 0
+        assert entry.billing is None
+
+    def test_public_reader_sees_child_only_usage_without_nested_double_counting(
+        self, temp_root: Path
+    ) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _event("workflow_started", {"name": "parent"}, ts=1000.0),
+                _event(
+                    "agent_completed",
+                    {
+                        "agent_name": "child",
+                        "tokens": 20,
+                        "cost_usd": 0.02,
+                        "subworkflow_path": ["child"],
+                    },
+                ),
+                _child_completion(
+                    tokens=20,
+                    cost=0.02,
+                    billing={"state": "subscription", "breakdown": {"subscription": 2}},
+                ),
+                _event("workflow_completed", {"elapsed": 5.0}, ts=1005.0),
+            ],
+        )
+        assert entry.outcome == "completed"
+        assert entry.total_tokens == 20
+        assert entry.total_cost_usd == pytest.approx(0.02)
+        assert entry.unpriced_agent_count == 0
+        assert _counts(entry) == {"subscription": 2}
+
+    def test_root_and_child_same_name_with_nested_completions_count_once(
+        self, temp_root: Path
+    ) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _event("workflow_started", {"name": "parent"}, ts=1.0),
+                _completion("agent_completed", "child", tokens=10, cost=0.01, mode="metered_api"),
+                _event("workflow_started", {"name": "nested", "subworkflow_path": ["child"]}),
+                _completion(
+                    "agent_completed",
+                    "child",
+                    tokens=40,
+                    cost=0.04,
+                    subworkflow_path=["child"],
+                ),
+                _child_completion(
+                    "grandchild",
+                    tokens=40,
+                    cost=0.04,
+                    billing={"state": "subscription", "breakdown": {"subscription": 1}},
+                    subworkflow_path=["child"],
+                ),
+                _event("workflow_completed", {"subworkflow_path": ["child"]}),
+                _child_completion(
+                    tokens=40,
+                    cost=0.04,
+                    billing={
+                        "state": "mixed",
+                        "breakdown": {"subscription": 1, "unknown": 1},
+                    },
+                ),
+            ],
+        )
+        assert entry.outcome == "unknown"
+        assert entry.total_tokens == 50
+        assert entry.total_cost_usd == pytest.approx(0.05)
+        assert _counts(entry) == {"metered_api": 1, "subscription": 1, "unknown": 1}
+
+    def test_repeated_calls_and_resume_keep_all_child_spend(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _event("workflow_started", {"name": "parent"}, ts=1.0),
+                _child_completion(
+                    tokens=10,
+                    cost=0.01,
+                    billing={"state": "subscription", "breakdown": {"subscription": 1}},
+                ),
+                _child_completion(
+                    tokens=20,
+                    cost=0.02,
+                    billing={"state": "metered_api", "breakdown": {"metered_api": 2}},
+                ),
+                _event("workflow_failed", {}, ts=2.0),
+                _event("workflow_started", {"name": "parent"}, ts=3.0),
+                _child_completion(
+                    tokens=30,
+                    cost=None,
+                    unpriced=2,
+                    billing={"state": "unknown", "breakdown": {"unknown": 2}},
+                ),
+                _event("workflow_completed", {"elapsed": 3.0}, ts=6.0),
+            ],
+        )
+        assert entry.outcome == "completed"
+        assert entry.total_tokens == 60
+        assert entry.total_cost_usd == pytest.approx(0.03)
+        assert entry.unpriced_agent_count == 2
+        assert _counts(entry) == {"subscription": 1, "metered_api": 2, "unknown": 2}
+
+    def test_partially_priced_child_keeps_unpriced_count_and_aggregate(
+        self, temp_root: Path
+    ) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _child_completion(
+                    tokens=50,
+                    cost=0.03,
+                    unpriced=2,
+                    billing={
+                        "state": "mixed",
+                        "breakdown": {"subscription": 1, "unstated": 2},
+                    },
+                )
+            ],
+        )
+        assert entry.total_tokens == 50
+        assert entry.total_cost_usd == pytest.approx(0.03)
+        assert entry.unpriced_agent_count == 2
+        assert _counts(entry) == {"subscription": 1, "unstated": 2}
+
+    @pytest.mark.parametrize(
+        (
+            "tokens",
+            "cost",
+            "unpriced",
+            "billing",
+            "expected_tokens",
+            "expected_cost",
+            "expected_unpriced",
+            "expected_billing",
+        ),
+        [
+            (True, False, True, {"breakdown": {"subscription": 1}}, 0, None, 0, {}),
+            ("50", float("inf"), -1, "subscription", 0, None, 0, {}),
+            (10, None, "two", ["subscription"], 10, None, 1, {"unstated": 1}),
+            (10, 0.01, 2.5, {"breakdown": {"subscription": True}}, 10, 0.01, 0, {"unstated": 1}),
+            (10, 0.01, 0, {"breakdown": {"subscription": 2}}, 10, 0.01, 0, {"subscription": 2}),
+        ],
+    )
+    def test_malformed_child_fields_do_not_poison_history(
+        self,
+        temp_root: Path,
+        tokens: object,
+        cost: object,
+        unpriced: object,
+        billing: object,
+        expected_tokens: int,
+        expected_cost: float | None,
+        expected_unpriced: int,
+        expected_billing: dict[str, int],
+    ) -> None:
+        entry = _entry_for(
+            temp_root,
+            [_child_completion(tokens=tokens, cost=cost, unpriced=unpriced, billing=billing)],
+        )
+        assert entry.total_tokens == expected_tokens
+        assert entry.total_cost_usd == expected_cost
+        assert entry.unpriced_agent_count == expected_unpriced
+        assert _counts(entry) == expected_billing
+
+    def test_for_each_item_envelopes_count_once_per_item(self, temp_root: Path) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _event("workflow_started", {"name": "parent"}, ts=1.0),
+                _child_completion(
+                    "jobs",
+                    tokens=20,
+                    cost=0.01,
+                    item_key="a",
+                    iteration=1,
+                    slot_key="jobs[a]",
+                    billing={"state": "subscription", "breakdown": {"subscription": 1}},
+                ),
+                _event(
+                    "for_each_item_completed",
+                    {"group_name": "jobs", "item_key": "a", "tokens": 20, "cost_usd": 0.01},
+                ),
+                _child_completion(
+                    "jobs",
+                    tokens=30,
+                    cost=None,
+                    unpriced=1,
+                    item_key="b",
+                    iteration=2,
+                    slot_key="jobs[b]",
+                    billing={"state": "metered_api", "breakdown": {"metered_api": 1}},
+                ),
+                _event("for_each_completed", {"group_name": "jobs", "tokens": 50}),
+                _event("workflow_completed", {}, ts=5.0),
+            ],
+        )
+        assert entry.outcome == "completed"
+        assert entry.total_tokens == 50
+        assert entry.total_cost_usd == pytest.approx(0.01)
+        assert entry.unpriced_agent_count == 1
+        assert _counts(entry) == {"subscription": 1, "metered_api": 1}
+
+    def test_one_shot_iterator_includes_child_aggregate(self) -> None:
+        events = [
+            json.loads(_event("workflow_started", {"name": "parent"}, ts=1.0)),
+            json.loads(
+                _child_completion(
+                    tokens=12,
+                    cost=0.03,
+                    billing={"state": "mixed", "breakdown": {"subscription": 1, "unknown": 2}},
+                )
+            ),
+            json.loads(_event("workflow_completed", {}, ts=3.0)),
+        ]
+        consumed = 0
+
+        def one_shot() -> Any:
+            nonlocal consumed
+            for event in events:
+                consumed += 1
+                yield event
+
+        scan = _scan_history_events(one_shot())
+        assert consumed == len(events)
+        assert scan.outcome == "completed"
+        assert scan.total_tokens == 12
+        assert scan.total_cost_usd == pytest.approx(0.03)
+        assert dict(scan.billing.breakdown) == {"subscription": 1, "unknown": 2}
 
 
 class TestHistoryBilling:
