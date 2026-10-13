@@ -114,14 +114,18 @@ def _format_agent_tokens(tokens: int | None) -> str:
     return f"{tokens} tok"
 
 
-def _format_agent_cost(cost_usd: float | None, billing: AggregateBilling | None = None) -> str:
+def _format_agent_cost(
+    cost_usd: float | None,
+    billing: AggregateBilling | None = None,
+    unpriced_agent_count: int = 0,
+) -> str:
     """Render a single agent's cost, or ``"—"`` when unavailable (no
     completion yet, or the model was unpriced).
 
     A figure whose executions stated a billing source also carries the compact label; a row
     with no dollar figure never does. ``billing=None`` is byte-identical to the old output.
     """
-    return format_cost_text(cost_usd, 0, billing)
+    return format_cost_text(cost_usd, unpriced_agent_count, billing)
 
 
 def _collect_detail(record: RunRecord) -> tuple[RunSummary | None, RunDetail | None]:
@@ -452,6 +456,6 @@ class RunDetailScreen(Screen):
             _agent_status_cell(agent.status),
             Text(_format_duration(agent.elapsed_seconds())),
             Text(_format_agent_tokens(agent.tokens)),
-            Text(_format_agent_cost(agent.cost_usd, agent.billing)),
+            Text(_format_agent_cost(agent.cost_usd, agent.billing, agent.unpriced_agent_count)),
             key=key,
         )

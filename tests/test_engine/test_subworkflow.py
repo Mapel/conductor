@@ -13,8 +13,10 @@ Tests cover:
 
 from __future__ import annotations
 
+import asyncio
 import textwrap
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,17 +24,24 @@ import pytest
 from conductor.config.schema import (
     AgentDef,
     ContextConfig,
+    ForEachDef,
     InputDef,
     LimitsConfig,
     OutputField,
+    ProviderSettings,
     RouteDef,
     RuntimeConfig,
+    StepDef,
     WorkflowConfig,
     WorkflowDef,
     WorkflowStepDef,
 )
 from conductor.engine.workflow import MAX_SUBWORKFLOW_DEPTH, WorkflowEngine
+from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import ExecutionError
+from conductor.fleet.history import _scan_history_events
+from conductor.fleet.summary import _scan_agent_details, _scan_events
+from conductor.providers.base import AgentOutput
 from conductor.providers.copilot import CopilotProvider
 
 
@@ -46,6 +55,617 @@ def _write_yaml(path: Path, content: str) -> Path:
     """Write YAML content to a file and return the path."""
     path.write_text(textwrap.dedent(content), encoding="utf-8")
     return path
+
+
+def _usage_provider(
+    responses: dict[str, tuple[dict[str, Any], int, int, str]],
+) -> CopilotProvider:
+    provider = CopilotProvider(mock_handler=lambda *_args: {})
+
+    async def execute(
+        agent: AgentDef, context: Any, rendered_prompt: str, **kwargs: Any
+    ) -> AgentOutput:
+        content, input_tokens, output_tokens, model = responses[agent.name]
+        return AgentOutput(
+            content=content,
+            raw_response="",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            tokens_used=input_tokens + output_tokens,
+            model=model,
+        )
+
+    provider.execute = execute  # type: ignore[method-assign]
+    return provider
+
+
+async def _run_usage(
+    config: WorkflowConfig, provider: CopilotProvider, path: Path
+) -> tuple[WorkflowEngine, list[WorkflowEvent]]:
+    emitter = WorkflowEventEmitter()
+    events: list[WorkflowEvent] = []
+    emitter.subscribe(events.append)
+    engine = WorkflowEngine(config, provider, event_emitter=emitter, workflow_path=path)
+    await engine.run({})
+    return engine, events
+
+
+def _usage_config(
+    agents: list[StepDef], *, for_each: list[ForEachDef] | None = None
+) -> WorkflowConfig:
+    return WorkflowConfig(
+        workflow=WorkflowDef(
+            name="parent",
+            entry_point=agents[0].name,
+            runtime=RuntimeConfig(provider=ProviderSettings(name="copilot")),
+            context=ContextConfig(mode="accumulate"),
+            limits=LimitsConfig(max_iterations=20),
+        ),
+        agents=agents,
+        for_each=for_each or [],
+        output={"result": "done"},
+    )
+
+
+def _root_completions(events: list[WorkflowEvent]) -> list[dict[str, Any]]:
+    return [
+        event.data
+        for event in events
+        if event.type == "subworkflow_completed" and not event.data.get("subworkflow_path")
+    ]
+
+
+class TestSubWorkflowUsage:
+    @pytest.mark.asyncio
+    async def test_unstated_multi_execution_child_preserves_billing_counts(
+        self, tmp_path: Path
+    ) -> None:
+        _write_yaml(
+            tmp_path / "child.yaml",
+            """\
+            workflow:
+              name: child
+              entry_point: first
+              runtime:
+                provider: copilot
+            agents:
+              - name: first
+                prompt: "first"
+                routes:
+                  - to: second
+              - name: second
+                prompt: "second"
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+        provider = _usage_provider({})
+
+        async def execute(
+            agent: AgentDef, context: Any, rendered_prompt: str, **kwargs: Any
+        ) -> AgentOutput:
+            return AgentOutput(
+                content={"result": "ok"},
+                raw_response="",
+                input_tokens=10,
+                output_tokens=2,
+                tokens_used=12,
+                model="claude-sonnet-4",
+                billing_mode="subscription" if agent.name == "front" else None,
+            )
+
+        provider.execute = execute  # type: ignore[method-assign]
+        engine, events = await _run_usage(
+            _usage_config(
+                [
+                    AgentDef(name="front", prompt="front", routes=[RouteDef(to="delegate")]),
+                    WorkflowStepDef(
+                        name="delegate", workflow="child.yaml", routes=[RouteDef(to="$end")]
+                    ),
+                ]
+            ),
+            provider,
+            parent,
+        )
+        (completed,) = _root_completions(events)
+        assert "billing" not in completed
+        assert completed["execution_count"] == 2
+        assert dict(engine.usage_tracker.get_summary().billing.breakdown) == {
+            "subscription": 1,
+            "unstated": 2,
+        }
+        wire = [event.to_dict() for event in events]
+        for scan in (_scan_events(wire), _scan_history_events(wire)):
+            assert scan.billing is not None
+            assert dict(scan.billing.breakdown) == {
+                "subscription": 1,
+                "unstated": 2,
+            }
+
+    @pytest.mark.asyncio
+    async def test_sequential_child_completion_is_local_not_parent_total(
+        self, tmp_path: Path
+    ) -> None:
+        _write_yaml(
+            tmp_path / "child.yaml",
+            """\
+            workflow:
+              name: child
+              entry_point: first
+              runtime:
+                provider: copilot
+            agents:
+              - name: first
+                prompt: "first"
+                routes:
+                  - to: second
+              - name: second
+                prompt: "second"
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+        engine, events = await _run_usage(
+            _usage_config(
+                [
+                    AgentDef(name="front", prompt="front", routes=[RouteDef(to="delegate")]),
+                    WorkflowStepDef(
+                        name="delegate", workflow="child.yaml", routes=[RouteDef(to="$end")]
+                    ),
+                ]
+            ),
+            _usage_provider(
+                {
+                    "front": ({"result": "ok"}, 30, 10, "claude-sonnet-4"),
+                    "first": ({"result": "ok"}, 11, 3, "claude-sonnet-4"),
+                    "second": ({"result": "ok"}, 17, 5, "claude-sonnet-4"),
+                }
+            ),
+            parent,
+        )
+
+        (completed,) = _root_completions(events)
+        child_events = [
+            event.data
+            for event in events
+            if event.type == "agent_completed" and event.data.get("subworkflow_path")
+        ]
+        assert completed["agent_name"] == "delegate"
+        assert completed["slot_key"] == "delegate"
+        assert completed["parent_path"] == []
+        assert completed["input_tokens"] == 28
+        assert completed["output_tokens"] == 8
+        assert completed["tokens"] == 36
+        assert completed["cost_usd"] == pytest.approx(
+            sum(event["cost_usd"] for event in child_events)
+        )
+        assert completed["unpriced_agent_count"] == 0
+        assert "billing" not in completed
+        assert engine.usage_tracker.get_summary().total_tokens == 76
+        assert completed["cost_usd"] < engine.usage_tracker.get_summary().total_cost_usd
+
+    @pytest.mark.asyncio
+    async def test_grandchild_subtotal_rolls_up_once(self, tmp_path: Path) -> None:
+        _write_yaml(
+            tmp_path / "leaf.yaml",
+            """\
+            workflow:
+              name: leaf
+              entry_point: leaf_agent
+              runtime:
+                provider: copilot
+            agents:
+              - name: leaf_agent
+                prompt: "leaf"
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+        _write_yaml(
+            tmp_path / "middle.yaml",
+            """\
+            workflow:
+              name: middle
+              entry_point: middle_agent
+              runtime:
+                provider: copilot
+            agents:
+              - name: middle_agent
+                prompt: "middle"
+                routes:
+                  - to: leaf
+              - name: leaf
+                type: workflow
+                workflow: leaf.yaml
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+        engine, events = await _run_usage(
+            _usage_config(
+                [
+                    WorkflowStepDef(
+                        name="middle", workflow="middle.yaml", routes=[RouteDef(to="$end")]
+                    )
+                ]
+            ),
+            _usage_provider(
+                {
+                    "middle_agent": ({"result": "ok"}, 11, 2, "claude-sonnet-4"),
+                    "leaf_agent": ({"result": "ok"}, 7, 3, "claude-sonnet-4"),
+                }
+            ),
+            parent,
+        )
+        (root,) = _root_completions(events)
+        (nested,) = [
+            event.data
+            for event in events
+            if event.type == "subworkflow_completed" and event.data.get("subworkflow_path")
+        ]
+        assert nested["subworkflow_path"] == ["middle"]
+        assert nested["parent_path"] == ["middle"]
+        assert nested["tokens"] == 10
+        assert root["tokens"] == engine.usage_tracker.get_summary().total_tokens == 23
+        assert root["cost_usd"] == pytest.approx(engine.usage_tracker.get_summary().total_cost_usd)
+
+        wire = [event.to_dict() for event in events]
+        for result in (_scan_events(wire), _scan_history_events(wire)):
+            assert result.total_tokens == 23
+            assert result.total_cost_usd == pytest.approx(root["cost_usd"])
+
+    @pytest.mark.asyncio
+    async def test_repeated_child_completions_accumulate_in_fleet(self, tmp_path: Path) -> None:
+        _write_yaml(
+            tmp_path / "child.yaml",
+            """\
+            workflow:
+              name: child
+              entry_point: inner
+              runtime:
+                provider: copilot
+            agents:
+              - name: inner
+                prompt: "inner"
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+        iterations = 0
+        provider = _usage_provider({})
+
+        async def execute(
+            agent: AgentDef, context: Any, rendered_prompt: str, **kwargs: Any
+        ) -> AgentOutput:
+            nonlocal iterations
+            if agent.name == "inner":
+                iterations += 1
+            return AgentOutput(
+                content={"done": iterations == 2} if agent.name == "decider" else {"result": "ok"},
+                raw_response="",
+                input_tokens=iterations * 5 if agent.name == "inner" else 0,
+                output_tokens=iterations * 2 if agent.name == "inner" else 0,
+                tokens_used=iterations * 7 if agent.name == "inner" else 0,
+                model="claude-sonnet-4",
+            )
+
+        provider.execute = execute  # type: ignore[method-assign]
+        engine, events = await _run_usage(
+            _usage_config(
+                [
+                    WorkflowStepDef(
+                        name="delegate", workflow="child.yaml", routes=[RouteDef(to="decider")]
+                    ),
+                    AgentDef(
+                        name="decider",
+                        prompt="decide",
+                        output={"done": OutputField(type="boolean")},
+                        routes=[
+                            RouteDef(to="$end", when="{{ output.done }}"),
+                            RouteDef(to="delegate"),
+                        ],
+                    ),
+                ]
+            ),
+            provider,
+            parent,
+        )
+        assert iterations == 2
+        assert [item["tokens"] for item in _root_completions(events)] == [7, 14]
+        assert engine.usage_tracker.get_summary().total_tokens == 21
+        wire = [event.to_dict() for event in events]
+        scan = _scan_events(wire)
+        assert scan.total_tokens == 21
+        assert scan.total_cost_usd == pytest.approx(
+            engine.usage_tracker.get_summary().total_cost_usd
+        )
+        _, _, details, _ = _scan_agent_details(wire)
+        assert {detail.name: detail.tokens for detail in details}["delegate"] == 21
+
+    @pytest.mark.asyncio
+    async def test_for_each_child_completions_have_distinct_usage_slots(
+        self, tmp_path: Path
+    ) -> None:
+        _write_yaml(
+            tmp_path / "child.yaml",
+            """\
+            workflow:
+              name: child
+              entry_point: inner
+              runtime:
+                provider: copilot
+            agents:
+              - name: inner
+                prompt: "inner {{ workflow.input.item }}"
+                routes:
+                  - to: unpriced
+              - name: unpriced
+                prompt: "unpriced {{ workflow.input.item }}"
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+        provider = _usage_provider({})
+        both_started = asyncio.Event()
+        b_completed = asyncio.Event()
+        started = 0
+
+        async def execute(
+            agent: AgentDef, context: Any, rendered_prompt: str, **kwargs: Any
+        ) -> AgentOutput:
+            nonlocal started
+            if agent.name == "finder":
+                return AgentOutput(
+                    content={"items": ["a", "b"]},
+                    raw_response="",
+                    input_tokens=8,
+                    output_tokens=2,
+                    tokens_used=10,
+                    model="claude-sonnet-4",
+                    billing_mode="subscription",
+                )
+            if agent.name == "unpriced":
+                return AgentOutput(
+                    content={"result": "ok"},
+                    raw_response="",
+                    input_tokens=3,
+                    output_tokens=1,
+                    tokens_used=4,
+                    model="unlisted-model",
+                )
+            item_tokens = 11 if "inner a" in rendered_prompt else 22
+            started += 1
+            if started == 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=5)
+            if item_tokens == 11:
+                await asyncio.wait_for(b_completed.wait(), timeout=5)
+            return AgentOutput(
+                content={"result": "ok"},
+                raw_response="",
+                input_tokens=item_tokens,
+                output_tokens=1 if item_tokens == 11 else 2,
+                tokens_used=12 if item_tokens == 11 else 24,
+                model="claude-sonnet-4",
+                billing_mode="subscription" if item_tokens == 11 else "metered_api",
+            )
+
+        provider.execute = execute  # type: ignore[method-assign]
+        emitter = WorkflowEventEmitter()
+        events: list[WorkflowEvent] = []
+
+        def collect(event: WorkflowEvent) -> None:
+            events.append(event)
+            if event.type == "subworkflow_completed" and event.data.get("slot_key") == "batch[1]":
+                b_completed.set()
+
+        emitter.subscribe(collect)
+        engine = WorkflowEngine(
+            _usage_config(
+                [
+                    AgentDef(
+                        name="finder",
+                        prompt="find",
+                        output={"items": OutputField(type="array")},
+                        routes=[RouteDef(to="batch")],
+                    )
+                ],
+                for_each=[
+                    ForEachDef.model_validate(
+                        {
+                            "name": "batch",
+                            "type": "for_each",
+                            "source": "finder.output.items",
+                            "as": "item",
+                            "max_concurrent": 2,
+                            "agent": {
+                                "name": "runner",
+                                "type": "workflow",
+                                "workflow": "child.yaml",
+                                "input_mapping": {"item": "{{ item }}"},
+                            },
+                            "routes": [{"to": "$end"}],
+                        }
+                    )
+                ],
+            ),
+            provider,
+            event_emitter=emitter,
+            workflow_path=parent,
+        )
+        await engine.run({})
+        assert [item["slot_key"] for item in _root_completions(events)] == [
+            "batch[1]",
+            "batch[0]",
+        ]
+        by_slot = {item["slot_key"]: item for item in _root_completions(events)}
+        assert {slot: item["tokens"] for slot, item in by_slot.items()} == {
+            "batch[0]": 16,
+            "batch[1]": 28,
+        }
+        assert {slot: item["unpriced_agent_count"] for slot, item in by_slot.items()} == {
+            "batch[0]": 1,
+            "batch[1]": 1,
+        }
+        assert {slot: item["billing"] for slot, item in by_slot.items()} == {
+            "batch[0]": {
+                "state": "mixed",
+                "breakdown": {"subscription": 1, "unstated": 1},
+            },
+            "batch[1]": {
+                "state": "mixed",
+                "breakdown": {"metered_api": 1, "unstated": 1},
+            },
+        }
+        assert by_slot["batch[0]"]["cost_usd"] is not None
+        assert by_slot["batch[1]"]["cost_usd"] is not None
+        assert by_slot["batch[0]"]["cost_usd"] != by_slot["batch[1]"]["cost_usd"]
+        assert by_slot["batch[0]"]["cost_usd"] + by_slot["batch[1]"]["cost_usd"] == pytest.approx(
+            engine.usage_tracker.get_summary().total_cost_usd
+            - next(
+                item.data["cost_usd"]
+                for item in events
+                if item.type == "agent_completed" and item.data.get("agent_name") == "finder"
+            )
+        )
+        assert {slot: item["item_key"] for slot, item in by_slot.items()} == {
+            "batch[0]": "0",
+            "batch[1]": "1",
+        }
+        items = {
+            item.data["item_key"]: item.data
+            for item in events
+            if item.type == "for_each_item_completed"
+        }
+        assert items["0"]["tokens"] == 16
+        assert items["1"]["tokens"] == 28
+        assert engine.usage_tracker.get_summary().total_tokens == 54
+        wire = [event.to_dict() for event in events]
+        for result in (_scan_events(wire), _scan_history_events(wire)):
+            assert result.total_tokens == 54
+            assert result.total_cost_usd == pytest.approx(
+                engine.usage_tracker.get_summary().total_cost_usd
+            )
+            assert result.unpriced_agent_count == 2
+            assert result.billing is not None
+            assert dict(result.billing.breakdown) == {
+                "subscription": 2,
+                "metered_api": 1,
+                "unstated": 2,
+            }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model,tokens", [("unlisted-model", 17), ("unlisted-model", 0)])
+    async def test_unpriced_and_zero_token_child(
+        self, tmp_path: Path, model: str, tokens: int
+    ) -> None:
+        _write_yaml(
+            tmp_path / "child.yaml",
+            """\
+            workflow:
+              name: child
+              entry_point: inner
+              runtime:
+                provider: copilot
+            agents:
+              - name: inner
+                prompt: "inner"
+                routes:
+                  - to: "$end"
+            output:
+              result: "done"
+            """,
+        )
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+        engine, events = await _run_usage(
+            _usage_config(
+                [
+                    WorkflowStepDef(
+                        name="delegate", workflow="child.yaml", routes=[RouteDef(to="$end")]
+                    )
+                ]
+            ),
+            _usage_provider({"inner": ({"result": "ok"}, tokens, 0, model)}),
+            parent,
+        )
+        (completed,) = _root_completions(events)
+        assert completed["tokens"] == tokens
+        assert completed["cost_usd"] is None
+        assert completed["unpriced_agent_count"] == int(tokens > 0)
+        assert "billing" not in completed
+        assert engine.usage_tracker.get_summary().has_unpriced is (tokens > 0)
+        wire = [event.to_dict() for event in events]
+        assert _scan_events(wire).unpriced_agent_count == int(tokens > 0)
+        assert _scan_history_events(wire).unpriced_agent_count == int(tokens > 0)
+        assert _scan_events(wire).total_cost_usd is None
+
+    @pytest.mark.asyncio
+    async def test_child_with_no_provider_usage_has_no_billing(self, tmp_path: Path) -> None:
+        _write_yaml(
+            tmp_path / "child.yaml",
+            """\
+            workflow:
+              name: child
+              entry_point: value
+            agents:
+              - name: value
+                type: set
+                value: "ready"
+                routes:
+                  - to: "$end"
+            output:
+              result: "{{ value.output }}"
+            """,
+        )
+        parent = tmp_path / "parent.yaml"
+        parent.write_text("dummy", encoding="utf-8")
+        engine, events = await _run_usage(
+            _usage_config(
+                [
+                    WorkflowStepDef(
+                        name="delegate", workflow="child.yaml", routes=[RouteDef(to="$end")]
+                    )
+                ]
+            ),
+            _usage_provider({}),
+            parent,
+        )
+        (completed,) = _root_completions(events)
+        assert completed["tokens"] == 0
+        assert completed["input_tokens"] == 0
+        assert completed["output_tokens"] == 0
+        assert completed["cost_usd"] is None
+        assert completed["unpriced_agent_count"] == 0
+        assert "billing" not in completed
+        assert engine.usage_tracker.get_summary().agents == []
+        wire = [event.to_dict() for event in events]
+        for result in (_scan_events(wire), _scan_history_events(wire)):
+            assert result.total_tokens == 0
+            assert result.total_cost_usd is None
+            assert result.billing is None
 
 
 class TestSubWorkflowLinear:
@@ -2212,8 +2832,6 @@ class TestSubWorkflowTerminate:
         protects parent authors from accidentally inheriting child-only
         termination semantics.
         """
-        from conductor.events import WorkflowEvent, WorkflowEventEmitter
-
         _write_yaml(
             tmp_workflow_dir / "sub.yaml",
             """\

@@ -38,6 +38,8 @@ from conductor.config.schema import (
 from conductor.engine.workflow import WorkflowEngine
 from conductor.events import WorkflowEvent, WorkflowEventEmitter
 from conductor.exceptions import BudgetExceededError
+from conductor.fleet.history import _scan_history_events
+from conductor.fleet.summary import _scan_agent_details, _scan_events
 from conductor.gates.interrupt import InterruptAction, InterruptResult
 from conductor.providers.base import AgentOutput
 from conductor.providers.copilot import CopilotProvider
@@ -373,6 +375,144 @@ class TestSubworkflowRollup:
         billing = engine.usage_tracker.get_summary().billing
         assert dict(billing.breakdown) == {"metered_api": 1, "subscription": 1}
         assert billing.state == "mixed"
+
+    @pytest.mark.asyncio
+    async def test_child_mixed_billing_excludes_parent_and_fleet_counts_executions(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "child.yaml").write_text(
+            textwrap.dedent(
+                """\
+                workflow:
+                  name: child
+                  entry_point: stated
+                  runtime:
+                    provider: copilot
+                agents:
+                  - name: stated
+                    prompt: "stated"
+                    routes:
+                      - to: unstated
+                  - name: unstated
+                    prompt: "unstated"
+                    routes:
+                      - to: "$end"
+                output:
+                  result: "done"
+                """
+            ),
+            encoding="utf-8",
+        )
+        parent_path = tmp_path / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+        config = _config(
+            [
+                _agent("front", route="delegate"),
+                WorkflowStepDef(
+                    name="delegate", workflow="child.yaml", routes=[RouteDef(to="$end")]
+                ),
+            ]
+        )
+        engine, events = await _run(
+            config,
+            _scripted_provider(
+                {"front": "subscription", "stated": "metered_api", "unstated": None}
+            ),
+            workflow_path=parent_path,
+        )
+
+        (completed,) = [
+            event.data
+            for event in events
+            if event.type == "subworkflow_completed" and not event.data.get("subworkflow_path")
+        ]
+        assert completed["billing"] == {
+            "state": "mixed",
+            "breakdown": {"metered_api": 1, "unstated": 1},
+        }
+        assert "billing_mode" not in completed
+        assert dict(engine.usage_tracker.get_summary().billing.breakdown) == {
+            "subscription": 1,
+            "metered_api": 1,
+            "unstated": 1,
+        }
+
+        wire = [event.to_dict() for event in events]
+        for result in (_scan_events(wire), _scan_history_events(wire)):
+            assert result.billing is not None
+            assert dict(result.billing.breakdown) == {
+                "subscription": 1,
+                "metered_api": 1,
+                "unstated": 1,
+            }
+        _, _, details, _ = _scan_agent_details(wire)
+        by_name = {detail.name: detail for detail in details}
+        delegate_billing = by_name["delegate"].billing
+        front_billing = by_name["front"].billing
+        assert delegate_billing is not None
+        assert front_billing is not None
+        assert dict(delegate_billing.breakdown) == {
+            "metered_api": 1,
+            "unstated": 1,
+        }
+        assert dict(front_billing.breakdown) == {"subscription": 1}
+
+    @pytest.mark.asyncio
+    async def test_unstated_child_omits_billing_without_inheriting_parent(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "child.yaml").write_text(
+            textwrap.dedent(
+                """\
+                workflow:
+                  name: child
+                  entry_point: inner
+                  runtime:
+                    provider: copilot
+                agents:
+                  - name: inner
+                    prompt: "inner"
+                    routes:
+                      - to: "$end"
+                output:
+                  result: "done"
+                """
+            ),
+            encoding="utf-8",
+        )
+        parent_path = tmp_path / "parent.yaml"
+        parent_path.write_text("dummy", encoding="utf-8")
+        _, events = await _run(
+            _config(
+                [
+                    _agent("front", route="delegate"),
+                    WorkflowStepDef(
+                        name="delegate", workflow="child.yaml", routes=[RouteDef(to="$end")]
+                    ),
+                ]
+            ),
+            _scripted_provider({"front": "subscription"}),
+            workflow_path=parent_path,
+        )
+        (completed,) = _of(events, "subworkflow_completed")
+        assert completed["tokens"] == 150
+        assert "billing" not in completed
+        assert "billing_mode" not in completed
+        wire = [event.to_dict() for event in events]
+        scan_billing = _scan_events(wire).billing
+        assert scan_billing is not None
+        assert dict(scan_billing.breakdown) == {
+            "subscription": 1,
+            "unstated": 1,
+        }
+        _, _, details, _ = _scan_agent_details(wire)
+        by_name = {detail.name: detail for detail in details}
+        delegate_billing = by_name["delegate"].billing
+        front_billing = by_name["front"].billing
+        assert delegate_billing is not None
+        assert front_billing is not None
+        assert dict(delegate_billing.breakdown) == {"unstated": 1}
+        assert dict(front_billing.breakdown) == {"subscription": 1}
 
 
 class TestValidator:

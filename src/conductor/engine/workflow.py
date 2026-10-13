@@ -2712,7 +2712,7 @@ class WorkflowEngine:
         agent: WorkflowStepDef,
         context: dict[str, Any],
         slot_key: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], WorkflowUsage]:
         """Execute a sub-workflow as a black-box step.
 
         Loads the referenced workflow YAML, creates a child WorkflowEngine,
@@ -2729,7 +2729,7 @@ class WorkflowEngine:
                 identities.
 
         Returns:
-            The sub-workflow's final output dict.
+            The sub-workflow's final output dict and its own usage snapshot.
 
         Raises:
             ExecutionError: If the sub-workflow file cannot be loaded,
@@ -2838,8 +2838,27 @@ class WorkflowEngine:
         # cost budget accounts for sub-workflow delegation. Without this,
         # type:workflow spend lives only in the child's tracker and bypasses
         # the parent's enforce-mode budget entirely.
-        self.usage_tracker.merge(child_engine.usage_tracker.get_summary())
-        return output
+        usage = child_engine.usage_tracker.get_summary()
+        self.usage_tracker.merge(usage)
+        return output, usage
+
+    @staticmethod
+    def _subworkflow_completion_data(
+        output: dict[str, Any], elapsed: float, usage: WorkflowUsage
+    ) -> dict[str, Any]:
+        """Build a parent-context completion from this child alone, not parent totals."""
+        billing = usage.billing.to_wire()
+        return {
+            "elapsed": elapsed,
+            "output": output,
+            "tokens": usage.total_tokens,
+            "input_tokens": usage.total_input_tokens,
+            "output_tokens": usage.total_output_tokens,
+            "cost_usd": usage.total_cost_usd,
+            "unpriced_agent_count": len(usage.unpriced_agents),
+            "execution_count": usage.billing.total,
+            **({"billing": billing} if billing is not None else {}),
+        }
 
     async def _execute_subworkflow_with_inputs(
         self,
@@ -6329,7 +6348,9 @@ class WorkflowEngine:
                             )
 
                             try:
-                                sub_output = await self._execute_subworkflow(agent, agent_context)
+                                sub_output, child_usage = await self._execute_subworkflow(
+                                    agent, agent_context
+                                )
                             except Exception as exc:
                                 _sub_elapsed = _time.time() - _sub_start
                                 self._emit(
@@ -6350,8 +6371,9 @@ class WorkflowEngine:
                                 "subworkflow_completed",
                                 {
                                     "agent_name": agent.name,
-                                    "elapsed": _sub_elapsed,
-                                    "output": sub_output,
+                                    **self._subworkflow_completion_data(
+                                        sub_output, _sub_elapsed, child_usage
+                                    ),
                                     "parent_path": list(self._dashboard_context_path),
                                     "slot_key": agent.name,
                                 },
@@ -7997,8 +8019,9 @@ class WorkflowEngine:
                             "agent_name": for_each_group.name,
                             "item_key": key,
                             "iteration": index + 1,
-                            "elapsed": _item_elapsed,
-                            "output": output_content,
+                            **self._subworkflow_completion_data(
+                                output_content, _item_elapsed, child_usage
+                            ),
                             "parent_path": list(getattr(self, "_dashboard_context_path", [])),
                             "slot_key": iteration_slot_key,
                         },

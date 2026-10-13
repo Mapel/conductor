@@ -1042,9 +1042,41 @@ class TestRunDetailBillingLabels:
         app = FleetApp()
         async with app.run_test() as pilot:
             screen = await _open_detail(app, pilot)
-            assert _cost_cells(screen) == ["—", "—"]
+            assert _cost_cells(screen) == ["(1 unpriced)", "—"]
             # Neither row shows a figure, so neither compact code is on screen to explain.
             assert _legend(screen).display is False
+
+    @pytest.mark.parametrize(
+        ("child_cost", "expected"),
+        [(0.25, "~$0.25 est. (1 unpriced)"), (None, "(2 unpriced)")],
+    )
+    async def test_child_row_preserves_partial_pricing_warning(
+        self, fleet_env: Path, tmp_path: Path, child_cost: float | None, expected: str
+    ) -> None:
+        _seed_detail_run(
+            tmp_path,
+            ["child"],
+            [
+                _event("agent_started", {"agent_name": "child"}),
+                _event(
+                    "subworkflow_completed",
+                    {
+                        "agent_name": "child",
+                        "tokens": 100,
+                        "cost_usd": child_cost,
+                        "unpriced_agent_count": 1 if child_cost is not None else 2,
+                        "billing": {
+                            "state": "subscription",
+                            "breakdown": {"subscription": 2},
+                        },
+                    },
+                ),
+            ],
+        )
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            screen = await _open_detail(app, pilot)
+            assert _cost_cells(screen) == [expected]
 
     async def test_legend_lists_exactly_the_visible_labels(
         self, fleet_env: Path, tmp_path: Path

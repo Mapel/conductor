@@ -299,16 +299,15 @@ def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
             if ts is not None:
                 result.ended_at = ts
 
-        elif etype in ("agent_completed", "parallel_agent_completed"):
+        elif etype in summary._USAGE_COMPLETION_EVENT_TYPES:
             tokens = _finite_float(data.get("tokens"))
             if tokens is not None:
                 result.total_tokens += int(tokens)
             cost = _finite_float(data.get("cost_usd"))
             if cost is not None:
                 result.total_cost_usd = (result.total_cost_usd or 0.0) + cost
-            elif tokens is not None and tokens > 0:
-                result.unpriced_agent_count += 1
-            summary._count_billing(result.billing_counts, data, tokens, cost)
+            result.unpriced_agent_count += summary._unpriced_count(etype, data, tokens, cost)
+            summary._count_billing(result.billing_counts, data, tokens, cost, event_type=etype)
 
     return result
 
