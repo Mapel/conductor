@@ -2856,6 +2856,7 @@ class WorkflowEngine:
             "output_tokens": usage.total_output_tokens,
             "cost_usd": usage.total_cost_usd,
             "unpriced_agent_count": len(usage.unpriced_agents),
+            "execution_count": usage.billing.total,
             **({"billing": billing} if billing is not None else {}),
         }
 

@@ -128,7 +128,11 @@ def _count_billing(
         # Legacy/malformed child payloads have no trustworthy per-execution
         # provenance. A billing_mode on the envelope is not the child's
         # aggregate; do not label all its spend with that one mode.
-        count_mode(counts, None)
+        count = data.get("execution_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            count = 1
+        for _ in range(count):
+            count_mode(counts, None)
         return
     count_mode(counts, coerce_billing_mode(data.get("billing_mode")))
 
@@ -140,7 +144,7 @@ def _unpriced_count(
     if event_type == "subworkflow_completed":
         count = data.get("unpriced_agent_count")
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
-            return count
+            return max(count, int(cost is None and tokens is not None and tokens > 0))
     return int(cost is None and tokens is not None and tokens > 0)
 
 
@@ -217,6 +221,9 @@ class AgentDetail:
     billing: AggregateBilling | None = None
     """Provenance of :attr:`cost_usd` -- the cumulative per-name total -- counted by
     ``_scan_agent_details`` on the same events. ``None`` when no event contributed usage."""
+
+    unpriced_agent_count: int = 0
+    """Cumulative executions whose usage has no usable price."""
 
     def elapsed_seconds(self, now: float | None = None) -> float | None:
         """Elapsed time for this row: live (``now - started_at``) while
@@ -859,6 +866,7 @@ def _scan_agent_details(
     cumulative_tokens: dict[str, int] = {}
     cumulative_cost: dict[str, float | None] = {}
     cumulative_billing: dict[str, dict[BillingClass, int]] = {}
+    cumulative_unpriced: dict[str, int] = {}
     started_at_by_name: dict[str, float] = {}
     # Steps with a presented-but-unresolved gate. An open step that is
     # waiting on a person is not the same as one that is working, and the
@@ -930,6 +938,9 @@ def _scan_agent_details(
                         cumulative_tokens[name] = cumulative_tokens.get(name, 0) + int(tokens)
                     if cost is not None:
                         cumulative_cost[name] = (cumulative_cost.get(name) or 0.0) + cost
+                    cumulative_unpriced[name] = cumulative_unpriced.get(name, 0) + _unpriced_count(
+                        etype, data, tokens, cost
+                    )
                     _count_billing(
                         cumulative_billing.setdefault(name, {}),
                         data,
@@ -1028,6 +1039,7 @@ def _scan_agent_details(
                     tokens=cum_tokens,
                     cost_usd=cum_cost,
                     billing=AggregateBilling.from_counts(cumulative_billing.get(ta.name, {})),
+                    unpriced_agent_count=cumulative_unpriced.get(ta.name, 0),
                 )
             )
             continue
@@ -1062,6 +1074,7 @@ def _scan_agent_details(
                 tokens=cum_tokens,
                 cost_usd=cum_cost,
                 billing=AggregateBilling.from_counts(cumulative_billing.get(ta.name, {})),
+                unpriced_agent_count=cumulative_unpriced.get(ta.name, 0),
             )
         )
 

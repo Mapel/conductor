@@ -2500,6 +2500,34 @@ class TestSubworkflowUsageInRunSummary:
         assert summary.unpriced_agent_count == 2
         assert _counts(summary) == {"subscription": 1, "metered_api": 2, "unknown": 2}
 
+    @pytest.mark.parametrize("cost", [None, float("inf")])
+    def test_explicit_zero_does_not_hide_missing_child_price(
+        self, tmp_path: Path, cost: object
+    ) -> None:
+        summary = _summary_for(
+            tmp_path,
+            [
+                _completion("agent_completed", "parent", tokens=10, cost=0.01),
+                _child_completion(tokens=20, cost=cost, unpriced=0),
+            ],
+        )
+        assert summary.total_cost_usd == pytest.approx(0.01)
+        assert summary.unpriced_agent_count == 1
+
+    @pytest.mark.parametrize("execution_count,expected", [(2, 2), (0, 1), (True, 1), (..., 1)])
+    def test_unstated_child_execution_multiplicity(
+        self, tmp_path: Path, execution_count: object, expected: int
+    ) -> None:
+        extras = {} if execution_count is ... else {"execution_count": execution_count}
+        summary = _summary_for(
+            tmp_path,
+            [
+                _completion("agent_completed", "parent", tokens=10, cost=0.01),
+                _child_completion(tokens=20, cost=None, unpriced=2, **extras),
+            ],
+        )
+        assert _counts(summary) == {"subscription": 1, "unstated": expected}
+
     def test_partially_priced_child_keeps_unpriced_count_and_aggregate(
         self, tmp_path: Path
     ) -> None:
@@ -2916,6 +2944,20 @@ class TestRunDetailBillingCounters:
         row = _row(detail, "a")
         assert row.billing is not None
         assert dict(row.billing.breakdown) == {"subscription": 1}
+
+    def test_child_unpriced_counts_accumulate_across_resume(self, tmp_path: Path) -> None:
+        detail = _detail_for(
+            tmp_path,
+            ["child"],
+            [
+                _child_completion(tokens=10, cost=0.25, unpriced=1),
+                _event("workflow_started", {"name": "parent", "agents": [{"name": "child"}]}),
+                _child_completion(tokens=20, cost=None, unpriced=2),
+            ],
+        )
+        row = _row(detail, "child")
+        assert row.cost_usd == pytest.approx(0.25)
+        assert row.unpriced_agent_count == 3
 
     def test_run_detail_row_billing_from_parallel_agent_completed(self, tmp_path: Path) -> None:
         detail = _detail_for(

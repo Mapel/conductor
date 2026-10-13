@@ -1175,6 +1175,34 @@ def _child_completion(
 
 
 class TestSubworkflowUsageInHistory:
+    @pytest.mark.parametrize("cost", [None, float("inf")])
+    def test_explicit_zero_does_not_hide_missing_child_price(
+        self, temp_root: Path, cost: object
+    ) -> None:
+        entry = _entry_for(
+            temp_root,
+            [
+                _completion("agent_completed", "parent", tokens=10, cost=0.01),
+                _child_completion(tokens=20, cost=cost, unpriced=0),
+            ],
+        )
+        assert entry.total_cost_usd == pytest.approx(0.01)
+        assert entry.unpriced_agent_count == 1
+
+    @pytest.mark.parametrize("execution_count,expected", [(2, 2), (0, 1), (True, 1), (..., 1)])
+    def test_unstated_child_execution_multiplicity(
+        self, temp_root: Path, execution_count: object, expected: int
+    ) -> None:
+        extras = {} if execution_count is ... else {"execution_count": execution_count}
+        entry = _entry_for(
+            temp_root,
+            [
+                _completion("agent_completed", "parent", tokens=10, cost=0.01),
+                _child_completion(tokens=20, cost=None, unpriced=2, **extras),
+            ],
+        )
+        assert _counts(entry) == {"subscription": 1, "unstated": expected}
+
     def test_malformed_aggregate_ignores_envelope_billing_mode(self, temp_root: Path) -> None:
         entry = _entry_for(
             temp_root,
